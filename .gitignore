@@ -1,0 +1,20 @@
+
+# Mac OS
+.DS_Store
+
+# runtime
+/test
+/pems
+/cache
+/data
+/logs
+/error.log
+/.tmp
+/__hijack
+/oss_mirror
+
+# binarys
+/output
+/build
+/build-all.sh
+/vendor
