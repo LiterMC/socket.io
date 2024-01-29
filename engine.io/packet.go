@@ -146,22 +146,18 @@ func (p *Packet) WriteTo(w io.Writer) (n int64, err error) {
 	return
 }
 
-func (p *Packet) ReadFrom(r io.Reader) (n int64, err error) {
-	var b byte
-	b, err = utils.ReadByte(r)
-	if err != nil {
-		return
+func (p *Packet) UnmarshalBinary(data []byte) (err error) {
+	if len(data) == 0 {
+		return io.EOF
 	}
-	n++
 
-	typ := pktTypeFromByte(b)
+	typ := pktTypeFromByte(data[0])
 	if typ == unknownType {
 		err = &UnexpectedPacketTypeError{typ}
 		return
 	}
 	p.typ = typ
 	// reuse buffer if possible
-	p.body, err = utils.ReadAllTo(r, p.body[:0])
-	n += (int64)(len(p.body))
+	p.body = append(p.body, data[1:]...)
 	return
 }

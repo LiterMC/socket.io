@@ -21,6 +21,7 @@ package engine
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -28,21 +29,27 @@ import (
 	"net/url"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/LiterMC/socket.io/internal/utils"
 	"github.com/gorilla/websocket"
 )
 
 const Protocol = 4
 
 var (
+	errMultipleOpen = errors.New("Engine.IO: socket was already opened")
+
 	ErrSocketConnected = errors.New("Engine.IO: socket was already connected")
-	ErrPingTimeout = errors.New("Engine.IO: did not receive PING packet for a long time")
+	ErrPingTimeout     = errors.New("Engine.IO: did not receive PING packet for a long time")
 )
 
+type SocketStatus = int32
+
 const (
-	SocketIdle int32 = iota
-	SocketUpgrading
+	SocketClosed SocketStatus = iota
+	SocketOpening
 	SocketConnected
 )
 
@@ -52,89 +59,85 @@ var WebsocketDialer *websocket.Dialer = &websocket.Dialer{
 }
 
 type Socket struct {
-	Dialer      *websocket.Dialer
-	url         *url.URL
-	query       url.Values
-	header      http.Header
-	dialTimeout time.Duration
+	Dialer *websocket.Dialer
+	opts   Options
+	url    url.URL
 
-	mux    sync.RWMutex
-	ctx    context.Context
-	cancel context.CancelCauseFunc
+	mux     sync.RWMutex
+	dialCtx context.Context
+	ctx     context.Context
+	cancel  context.CancelCauseFunc
 
-	ConnectHandle    func(s *Socket)
-	DisconnectHandle func(s *Socket)
-	ErrorHandle      func(s *Socket, err error)
-	PongHandle       func(s *Socket, pkt *Packet)
-	MessageHandle    func(s *Socket, pkt *Packet)
+	connectHandles    utils.HandlerList[*Socket, struct{}]
+	disconnectHandles utils.HandlerList[*Socket, error]
+	pongHandles       utils.HandlerList[*Socket, []byte]
+	binaryHandlers    utils.HandlerList[*Socket, []byte]
+	messageHandles    utils.HandlerList[*Socket, []byte]
 
-	wsconn       *websocket.Conn
-	status       int32
-	sid          string
-	pingInterval time.Duration
-	pingTimeout  time.Duration
-	maxPayload   int
+	wsconn        *websocket.Conn
+	status        atomic.Int32
+	sid           string
+	pingInterval  time.Duration
+	pingTimeout   time.Duration
+	maxPayload    int
+	reDialTimeout time.Duration
 
 	notifyCh chan struct{}
 	msgCh    chan *Packet
 	msgbuf   []*Packet
 }
 
-type SocketOptions func(s *Socket)
-
-func WithQuery(query url.Values) SocketOptions {
-	return func(s *Socket) {
-		s.query = query
-	}
+type Options struct {
+	Host         string // <host>:<port>
+	Path         string
+	Secure       bool
+	ExtraQuery   url.Values
+	ExtraHeaders http.Header
+	DialTimeout  time.Duration
 }
 
-func WithHeader(header http.Header) SocketOptions {
-	return func(s *Socket) {
-		s.header = header
-	}
+var DefaultOption = Options{
+	Path:   "/engine.io",
+	Secure: true,
 }
 
-func WithDialTimeout(timeout time.Duration) SocketOptions {
-	return func(s *Socket) {
-		s.dialTimeout = timeout
+func NewSocket(opts Options) (s *Socket, err error) {
+	dialURL := url.URL{
+		Host: opts.Host,
+		Path: opts.Path,
 	}
-}
+	if opts.Secure {
+		dialURL.Scheme = "wss"
+	} else {
+		dialURL.Scheme = "ws"
+	}
+	query := make(url.Values, 2+len(opts.ExtraQuery))
+	for k, v := range opts.ExtraQuery {
+		query[k] = v
+	}
+	query.Set("EIO", strconv.Itoa(Protocol))
+	query.Set("transport", "websocket")
+	dialURL.RawQuery = query.Encode()
 
-func NewSocket(path string, opts ...SocketOptions) (s *Socket, err error) {
 	s = &Socket{
 		Dialer:   WebsocketDialer,
+		opts:     opts,
+		url:      dialURL,
 		notifyCh: make(chan struct{}, 1),
 		msgCh:    make(chan *Packet, 0),
 	}
-
-	if s.url, err = url.Parse(path); err != nil {
-		return
-	}
-
-	for _, opt := range opts {
-		opt(s)
-	}
-
-	if s.query == nil {
-		s.query = make(url.Values, 2)
-	}
-	s.query.Set("EIO", strconv.Itoa(Protocol))
-	s.query.Set("transport", "websocket")
-	s.url.RawQuery = s.query.Encode()
 	return
 }
 
-func (s *Socket) Status() int32 {
-	s.mux.RLock()
-	defer s.mux.RUnlock()
-	return s.status
+func (s *Socket) Status() SocketStatus {
+	return s.status.Load()
 }
 
 func (s *Socket) Connected() bool {
 	return s.Status() == SocketConnected
 }
 
-func (s *Socket) Id() string {
+func (s *Socket) ID() string {
 	s.mux.RLock()
 	defer s.mux.RUnlock()
 	return s.sid
@@ -152,82 +155,148 @@ func (s *Socket) Conn() *websocket.Conn {
 	return s.wsconn
 }
 
-func (s *Socket) Dial(ctx context.Context) (err error) {
-	s.mux.Lock()
-	defer s.mux.Unlock()
-
-	if s.status != SocketIdle {
-		return ErrSocketConnected
-	}
-
-	hasSid := s.sid != ""
-	if hasSid {
-		s.query.Set("sid", s.sid)
-	}
-	s.url.RawQuery = s.query.Encode()
-	if hasSid {
-		s.query.Del("sid")
-	}
-
+func (s *Socket) dial(ctx context.Context) (err error) {
 	var wsconn *websocket.Conn
-	if s.dialTimeout > 0 {
-		tctx, cancel := context.WithTimeout(ctx, s.dialTimeout)
-		wsconn, _, err = s.Dialer.DialContext(tctx, s.url.String(), s.header)
+	if s.opts.DialTimeout > 0 {
+		tctx, cancel := context.WithTimeout(ctx, s.opts.DialTimeout)
+		wsconn, _, err = s.Dialer.DialContext(tctx, s.url.String(), s.opts.ExtraHeaders)
 		cancel()
 	} else {
-		wsconn, _, err = s.Dialer.DialContext(ctx, s.url.String(), s.header)
+		wsconn, _, err = s.Dialer.DialContext(ctx, s.url.String(), s.opts.ExtraHeaders)
 	}
 	if err != nil {
-		s.status = SocketIdle
 		return
 	}
-	s.ctx, s.cancel = context.WithCancelCause(ctx)
+	s.ctx, s.cancel = context.WithCancelCause(s.dialCtx)
 	s.wsconn = wsconn
-	s.status = SocketUpgrading
+	s.msgbuf = s.msgbuf[:0]
+	s.reDialTimeout = time.Second
 
 	wsconn.SetCloseHandler(s.wsCloseHandler)
-
-	go s._reader(s.ctx, wsconn)
-	go s._writer(s.ctx, wsconn)
 
 	return
 }
 
-func (s *Socket) onError(err error) {
-	if s.ErrorHandle != nil {
-		s.ErrorHandle(s, err)
+func (s *Socket) Dial(ctx context.Context) (err error) {
+	if s.status.Load() != SocketClosed {
+		return ErrSocketConnected
+	}
+
+	s.mux.Lock()
+	defer s.mux.Unlock()
+
+	if s.status.CompareAndSwap(SocketClosed, SocketOpening) || s.wsconn != nil {
+		return ErrSocketConnected
+	}
+
+	s.dialCtx = ctx
+	if err = s.dial(ctx); err != nil {
+		s.status.Store(SocketClosed)
+		return
+	}
+
+	go s._reader(s.ctx, s.wsconn)
+
+	return
+}
+
+func (s *Socket) reDial() (err error) {
+	if s.status.Load() != SocketClosed {
+		return ErrSocketConnected
+	}
+
+	s.mux.Lock()
+	defer s.mux.Unlock()
+
+	if s.status.CompareAndSwap(SocketClosed, SocketOpening) {
+		return ErrSocketConnected
+	}
+
+	if err = s.dial(s.dialCtx); err != nil {
+		s.status.Store(SocketClosed)
+		return
+	}
+
+	go s._reader(s.ctx, s.wsconn)
+
+	return
+}
+
+func (s *Socket) onMessage(data []byte) {
+	s.messageHandles.Call(s, data)
+}
+
+func (s *Socket) onClose(err error) {
+	s.mux.RLock()
+	if wsconn := s.wsconn; wsconn != nil {
+		wsconn.SetCloseHandler(nil)
+		wsconn.Close()
+	}
+	s.cancel(err)
+	dialCtx := s.dialCtx
+	s.mux.RUnlock()
+
+	if s.status.Swap(SocketClosed) != SocketClosed && err != nil {
+		if s.reDialTimeout < time.Minute*5 {
+			s.reDialTimeout = s.reDialTimeout * 2
+		}
+		go func(ctx context.Context, timeout time.Duration) {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(timeout):
+				s.reDial()
+			}
+		}(dialCtx, s.reDialTimeout)
+	}
+
+	s.disconnectHandles.Call(s, err)
+}
+
+func (s *Socket) OnConnect(cb func(s *Socket)) {
+	s.connectHandles.On(func(s *Socket, _ struct{}) {
+		cb(s)
+	})
+	// TODO: Or maybe?
+	// ptr := new(func(s *Socket))
+	// *ptr = cb
+	// s.connectHandles.On(*(func(*Socket, struct{}))((unsafe.Pointer)(ptr)))
+}
+
+func (s *Socket) OnceConnect(cb func(s *Socket)) {
+	if s.Connected() {
+		cb(s)
+	} else {
+		s.connectHandles.Once(func(s *Socket, _ struct{}) {
+			cb(s)
+		})
 	}
 }
 
-func (s *Socket) onMessage(pkt *Packet) {
-	if s.MessageHandle != nil {
-		s.MessageHandle(s, pkt)
-	}
+func (s *Socket) OnDisconnect(cb func(s *Socket, err error)) {
+	s.disconnectHandles.On(cb)
+}
+
+func (s *Socket) OnPong(cb func(s *Socket, data []byte)) {
+	s.pongHandles.On(cb)
+}
+
+func (s *Socket) OnBinary(cb func(s *Socket, data []byte)) {
+	s.binaryHandlers.On(cb)
+}
+
+func (s *Socket) OnMessage(cb func(s *Socket, data []byte)) {
+	s.messageHandles.On(cb)
 }
 
 func (s *Socket) wsCloseHandler(code int, text string) error {
-	s.mux.Lock()
-	s.status = SocketIdle
-	s.mux.Unlock()
+	s.status.Store(SocketClosed)
 
 	wer := &websocket.CloseError{Code: code, Text: text}
-	if s.DisconnectHandle != nil {
-		s.DisconnectHandle(s)
-	}
-	if code != websocket.CloseNormalClosure {
-		s.onError(wer)
-		w := time.Second
-		for i := 0; i < 10; i++ {
-			err := s.Dial(s.ctx)
-			if err == nil || err == ErrSocketConnected {
-				return nil
-			}
-			s.onError(err)
-			time.Sleep(w)
-			if w < 10*time.Minute {
-				w *= 2
-			}
-		}
+	if code == websocket.CloseNormalClosure {
+		s.onClose(nil)
+	} else {
+		s.onClose(wer)
 	}
 	return nil
 }
@@ -235,21 +304,22 @@ func (s *Socket) wsCloseHandler(code int, text string) error {
 func (s *Socket) _reader(ctx context.Context, wsconn *websocket.Conn) {
 	defer wsconn.Close()
 
+	openCh := make(chan struct{}, 0)
 	pingCh := make(chan struct{}, 1)
 
-	go func(){
+	go func() {
 		defer wsconn.Close()
 		select {
 		case <-ctx.Done():
 			return
-		case <-pingCh:
+		case <-openCh:
 		}
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-time.After(s.pingInterval + s.pingTimeout):
-				s.onError(ErrPingTimeout)
+				s.onClose(ErrPingTimeout)
 				return
 			case <-pingCh:
 			}
@@ -257,22 +327,62 @@ func (s *Socket) _reader(ctx context.Context, wsconn *websocket.Conn) {
 	}()
 
 	pkt := new(Packet)
+	var buf []byte
 	for {
 		code, r, err := wsconn.NextReader()
 		if err != nil {
-			s.onError(err)
+			s.mux.RLock()
+			ok := wsconn == s.wsconn
+			s.mux.RUnlock()
+			if ok {
+				s.onClose(err)
+			}
 			return
 		}
-		if code != websocket.TextMessage {
+
+		// reset ping timer
+		select {
+		case pingCh <- struct{}{}:
+		default:
+		}
+
+		switch code {
+		case websocket.BinaryMessage:
+			if buf, err = utils.ReadAllTo(r, buf[:0]); err != nil {
+				s.onClose(err)
+				return
+			}
+			s.binaryHandlers.Call(s, buf)
+			continue
+		case websocket.TextMessage:
+			if buf, err = utils.ReadAllTo(r, buf[:0]); err != nil {
+				s.onClose(err)
+				return
+			}
+			if len(buf) > 0 && buf[0] == 'b' {
+				n, err := base64.StdEncoding.Decode(buf, buf[1:])
+				if err != nil {
+					s.onClose(err)
+					return
+				}
+				s.binaryHandlers.Call(s, buf[:n])
+				continue
+			}
+		default:
 			continue
 		}
-		_, err = pkt.ReadFrom(r)
-		if err != nil {
-			s.onError(err)
-			continue
+
+		if err = pkt.UnmarshalBinary(buf); err != nil {
+			s.onClose(err)
+			return
 		}
+
 		switch pkt.typ {
 		case OPEN:
+			if s.Status() != SocketOpening {
+				s.onClose(errMultipleOpen)
+				return
+			}
 			var obj struct {
 				Sid          string   `json:"sid"`
 				Upgrades     []string `json:"upgrades"`
@@ -280,45 +390,38 @@ func (s *Socket) _reader(ctx context.Context, wsconn *websocket.Conn) {
 				PingTimeout  int      `json:"pingTimeout"`
 				MaxPayload   int      `json:"maxPayload"`
 			}
-			if err = pkt.UnmarshalBody(&obj); err != nil {
-				s.onError(err)
+			if err := pkt.UnmarshalBody(&obj); err != nil {
+				s.onClose(err)
 				break
 			}
+
+			s.mux.Lock()
 			s.sid = obj.Sid
 			s.pingInterval = (time.Duration)(obj.PingInterval) * time.Millisecond
 			s.pingTimeout = (time.Duration)(obj.PingTimeout) * time.Millisecond
 			s.maxPayload = obj.MaxPayload
-			if s.ConnectHandle != nil {
-				s.ConnectHandle(s)
+			for _, pkt := range s.msgbuf {
+				sendPkt(wsconn, pkt)
 			}
-			select {
-			case pingCh <- struct{}{}:
-			default:
-			}
+			s.msgbuf = s.msgbuf[:0]
+			s.status.Store(SocketConnected)
+			s.mux.Unlock()
+
+			close(openCh)
+
+			s.connectHandles.Call(s, struct{}{})
 		case CLOSE:
-			if s.DisconnectHandle != nil {
-				s.DisconnectHandle(s)
-			}
-			s.Close()
+			s.onClose(nil)
 			return
 		case PING:
-			select {
-			case pingCh <- struct{}{}:
-			default:
-			}
 			pkt.typ = PONG
-			s.emit(pkt)
+			s.send(pkt)
 		case PONG:
-			if s.PongHandle != nil {
-				s.PongHandle(s, pkt)
-			}
+			s.pongHandles.Call(s, pkt.body)
 		case MESSAGE:
-			s.onMessage(pkt)
+			s.onMessage(pkt.body)
 		default:
-			s.onError(fmt.Errorf("Engine.IO: unsupported packet type %s", pkt.typ))
-		}
-		if err != nil {
-			s.onError(err)
+			s.onClose(fmt.Errorf("Engine.IO: unsupported packet type %s", pkt.typ))
 		}
 	}
 }
@@ -336,84 +439,32 @@ func sendPkt(wsconn *websocket.Conn, pkt *Packet) (err error) {
 	return
 }
 
-func (s *Socket) _writer(ctx context.Context, wsconn *websocket.Conn) {
-	defer wsconn.Close()
-
-	var msgbuf []*Packet
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-s.notifyCh:
-			s.mux.Lock()
-			msgbuf, s.msgbuf = s.msgbuf, msgbuf[:0]
-			s.mux.Unlock()
-			for i, pkt := range msgbuf {
-				if err := sendPkt(wsconn, pkt); err != nil {
-					s.onError(err)
-					msgbuf = msgbuf[:copy(msgbuf, msgbuf[i:])]
-					s.mux.Lock()
-					msgbuf, s.msgbuf = s.msgbuf, append(msgbuf, s.msgbuf...)
-					s.mux.Unlock()
-					break
-				}
-			}
-		case pkt := <-s.msgCh:
-			s.mux.Lock()
-			msgbuf, s.msgbuf = s.msgbuf, msgbuf[:0]
-			s.mux.Unlock()
-			ok := pkt != nil
-			for i, pkt := range msgbuf {
-				if err := sendPkt(wsconn, pkt); err != nil {
-					s.onError(err)
-					msgbuf = msgbuf[:copy(msgbuf, msgbuf[i:])]
-					s.mux.Lock()
-					msgbuf, s.msgbuf = s.msgbuf, append(msgbuf, s.msgbuf...)
-					if ok {
-						ok = false
-						s.msgbuf = append(s.msgbuf, pkt)
-					}
-					s.mux.Unlock()
-					break
-				}
-			}
-			if ok {
-				if err := sendPkt(wsconn, pkt); err != nil {
-					s.onError(err)
-				}
-			}
-		}
-	}
-}
-
 func (s *Socket) Close() error {
-	s.emit(&Packet{
+	s.send(&Packet{
 		typ: CLOSE,
 	})
 	return nil
 }
 
-func (s *Socket) refreshPackets() {
-	select {
-	case s.notifyCh <- struct{}{}:
-	default:
-	}
-}
-
-func (s *Socket) emit(pkt *Packet) {
-	select {
-	case s.msgCh <- pkt:
-	default:
-		s.mux.Lock()
+func (s *Socket) send(pkt *Packet) {
+	s.mux.Lock()
+	if s.Status() != SocketConnected {
 		s.msgbuf = append(s.msgbuf, pkt)
 		s.mux.Unlock()
-		s.refreshPackets()
+		return
 	}
+	wsconn := s.wsconn
+	s.mux.Unlock()
+
+	if err := sendPkt(wsconn, pkt); err != nil {
+		s.onClose(err)
+	}
+	return
 }
 
 func (s *Socket) Emit(body []byte) {
-	s.emit(&Packet{
-		typ: MESSAGE,
+	s.send(&Packet{
+		typ:  MESSAGE,
 		body: body,
 	})
 }

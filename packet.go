@@ -20,6 +20,7 @@
 package socket
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,7 +30,30 @@ import (
 	"github.com/LiterMC/socket.io/internal/utils"
 )
 
-var errTooMuchArgs = errors.New("Too much arguments were given")
+var (
+	errTooMuchArgs      = errors.New("Too much arguments were given")
+	errIncompletePacket = errors.New("Incomplete packet")
+)
+
+type UnexpectedPacketTypeError struct {
+	Type PacketType
+}
+
+var _ error = (*UnexpectedPacketTypeError)(nil)
+
+func (e *UnexpectedPacketTypeError) Error() string {
+	return fmt.Sprintf("Unexpected packet type %d", e.Type)
+}
+
+type UnexpectedTokenError struct {
+	Token byte
+}
+
+var _ error = (*UnexpectedTokenError)(nil)
+
+func (e *UnexpectedTokenError) Error() string {
+	return fmt.Sprintf("Unexpected token %q", e.Token)
+}
 
 type PacketType int8
 
@@ -107,9 +131,9 @@ func pktTypeFromByte(id byte) PacketType {
 type Packet struct {
 	typ       PacketType
 	namespace string
-	id        int64
-	data      []any
-	attachs []io.Reader
+	id        int
+	data      []byte
+	attachs   [][]byte
 }
 
 func (p *Packet) Type() PacketType {
@@ -120,19 +144,43 @@ func (p *Packet) String() string {
 	return fmt.Sprintf("Packet(%s, %q, %d, <%d bytes>)", p.typ.String(), p.namespace, p.id, len(p.data))
 }
 
-func (p *Packet) SetData(args ...any) {
+func (p *Packet) SetData(args ...any) (err error) {
+	p.data = nil
+	p.attachs = p.attachs[:0]
+	if len(args) == 0 {
+		return
+	}
 	switch p.typ {
-	case BINARY_EVENT, BINARY_ACK:
-		// TODO: replace placeholder for BINARY_EVENT and BINARY_ACK
-		fallthrough
-	case EVENT, ACK:
+	case EVENT, ACK, BINARY_EVENT, BINARY_ACK:
+		p.encodeAttachs(args)
+		if len(p.attachs) > 0 {
+			switch p.typ {
+			case EVENT:
+				p.typ = BINARY_EVENT
+			case ACK:
+				p.typ = BINARY_ACK
+			}
+		}
+		p.data, err = json.Marshal(args)
 	default:
 		if len(args) > 1 {
 			panic(errTooMuchArgs)
 		}
+		p.data, err = json.Marshal(args[0])
 	}
-	p.data = args
 	return
+}
+
+func (p *Packet) UnmarshalData(ptr any) (err error) {
+	if err = json.Unmarshal(p.data, ptr); err != nil {
+		return
+	}
+	p.decodeAttachs(ptr)
+	return
+}
+
+func (p *Packet) Attachments() [][]byte {
+	return p.attachs
 }
 
 func (p *Packet) WriteTo(w io.Writer) (n int64, err error) {
@@ -141,6 +189,14 @@ func (p *Packet) WriteTo(w io.Writer) (n int64, err error) {
 		return
 	}
 	n++
+	var buf [10]byte
+	if attLeng := len(p.attachs); attLeng > 0 {
+		n0, err = w.Write(append(strconv.AppendInt(buf[:0], (int64)(attLeng), 10), '-'))
+		n += (int64)(n0)
+		if err != nil {
+			return
+		}
+	}
 	if p.namespace != "" && p.namespace != "/" {
 		if n0, err = io.WriteString(w, p.namespace); err != nil {
 			return
@@ -152,19 +208,89 @@ func (p *Packet) WriteTo(w io.Writer) (n int64, err error) {
 		n++
 	}
 	if p.id > 0 {
-		var buf [10]byte
-		n0, err = w.Write(strconv.AppendInt(buf[:0], p.id, 10))
+		n0, err = w.Write(strconv.AppendInt(buf[:0], (int64)(p.id), 10))
 		n += (int64)(n0)
 		if err != nil {
 			return
 		}
 	}
 	if len(p.data) > 0 {
-		json.NewEncoder(w).Encode(p.data)
+		n0, err = w.Write(p.data)
+		n += (int64)(n0)
+		if err != nil {
+			return
+		}
 	}
 	return
 }
 
-func (p *Packet) Reset(r io.Reader)(err error){
+func (p *Packet) UnmarshalBinary(data []byte) (err error) {
+	if len(data) == 0 {
+		return io.EOF
+	}
+	typ := pktTypeFromByte(data[0])
+	if typ == unknownType {
+		err = &UnexpectedPacketTypeError{typ}
+		return
+	}
+	p.typ = typ
+	p.namespace = ""
+	p.id = 0
+	p.data = p.data[:0]
+	p.attachs = p.attachs[:0]
+
+	if data = data[1:]; len(data) == 0 {
+		return
+	}
+
+	var (
+		num int
+
+		attachLen int
+	)
+	num, data = readNumber(data)
+	if num >= 0 { // if read a number
+		if ok := len(data) > 0; ok && data[0] == '-' { // is <# of binary attachments>-
+			attachLen = num
+		} else { // assume it is <acknowledgment id>
+			p.id = num
+			if ok {
+				goto READ_DATA
+			}
+			return
+		}
+	}
+	if data[0] == '/' { // is <namespace>,
+		i := bytes.IndexByte(data, ',')
+		if i < 0 {
+			return io.EOF
+		}
+		p.namespace, data = (string)(data[:i]), data[i+1:]
+	}
+READ_DATA:
+	p.data = append(p.data, data...)
+	if cap(p.attachs) >= attachLen {
+		p.attachs = p.attachs[:attachLen]
+	} else {
+		p.attachs = make([][]byte, attachLen)
+	}
 	return
+}
+
+func readNumber(data []byte) (num int, rest []byte) {
+	if len(data) == 0 || data[0] < '0' || '9' < data[0] {
+		return -1, data
+	}
+	for {
+		if len(data) == 0 {
+			return
+		}
+		b := data[0]
+		if b < '0' || '9' < b {
+			rest = data
+			return
+		}
+		data = data[1:]
+		num = num*10 + (int)(b-'0')
+	}
 }
