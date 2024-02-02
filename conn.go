@@ -45,7 +45,7 @@ func (e *ConnectError) Error() string {
 	return "Socket.IO: connect error: " + e.Reason
 }
 
-type SocketStatus = int32
+type SocketStatus int32
 
 const (
 	SocketClosed SocketStatus = iota
@@ -57,7 +57,7 @@ type Socket struct {
 	io *engine.Socket
 
 	mux       sync.RWMutex
-	status    int32
+	status    SocketStatus
 	sid, pid  string
 	namespace string
 
@@ -96,6 +96,12 @@ func (s *Socket) ID() string {
 	s.mux.RLock()
 	defer s.mux.RUnlock()
 	return s.sid
+}
+
+func (s *Socket) Status() SocketStatus {
+	s.mux.RLock()
+	defer s.mux.RUnlock()
+	return s.status
 }
 
 func (s *Socket) Connect(namespace string) (err error) {
@@ -163,6 +169,22 @@ func (s *Socket) Namespace() string {
 	s.mux.RLock()
 	defer s.mux.RUnlock()
 	return s.namespace
+}
+
+func (s *Socket) Close() (err error) {
+	s.mux.Lock()
+	defer s.mux.Unlock()
+
+	if s.status == SocketClosed {
+		return
+	}
+
+	err = s.send(&Packet{
+		typ: DISCONNECT,
+		namespace: s.namespace,
+	})
+	s.status = SocketClosed
+	return
 }
 
 func (s *Socket) onError(err error) {
@@ -257,6 +279,7 @@ func (s *Socket) onMessage(_ *engine.Socket, data []byte) {
 			s.connectHandles.Call(s, pkt.namespace)
 		}
 	case DISCONNECT:
+		s.disconnected()
 		s.disconnectHandles.Call(s, pkt.namespace)
 	case EVENT, BINARY_EVENT:
 		if len(pkt.Attachments()) == 0 {

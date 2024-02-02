@@ -28,6 +28,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -88,20 +89,25 @@ type Socket struct {
 }
 
 type Options struct {
+	Secure       bool
 	Host         string // <host>:<port>
 	Path         string
-	Secure       bool
 	ExtraQuery   url.Values
 	ExtraHeaders http.Header
 	DialTimeout  time.Duration
 }
 
 var DefaultOption = Options{
-	Path:   "/engine.io",
 	Secure: true,
+	Path:   "/engine.io/",
 }
 
 func NewSocket(opts Options) (s *Socket, err error) {
+	if i := strings.Index(opts.Host, "://"); i > 0 {
+		scheme := opts.Host[:i]
+		opts.Host = opts.Host[i+len("://"):]
+		opts.Secure = !(scheme == "ws" || scheme == "http")
+	}
 	dialURL := url.URL{
 		Host: opts.Host,
 		Path: opts.Path,
@@ -153,6 +159,12 @@ func (s *Socket) Conn() *websocket.Conn {
 	s.mux.RLock()
 	defer s.mux.RUnlock()
 	return s.wsconn
+}
+
+func (s *Socket) URL() *url.URL {
+	s.mux.RLock()
+	defer s.mux.RUnlock()
+	return &s.url
 }
 
 func (s *Socket) dial(ctx context.Context) (err error) {
