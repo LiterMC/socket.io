@@ -58,8 +58,8 @@ type Socket struct {
 
 	mux       sync.RWMutex
 	status    int32
-	namespace string
 	sid, pid  string
+	namespace string
 
 	packet               Packet
 	reconstructingAttach int
@@ -248,9 +248,12 @@ func (s *Socket) onMessage(_ *engine.Socket, data []byte) {
 			Pid string `json:"pid"`
 		}
 		if err := pkt.UnmarshalData(&obj); err == nil {
+			s.mux.Lock()
 			s.status = SocketConnected
 			s.sid = obj.Sid
 			s.pid = obj.Pid
+			s.namespace = pkt.namespace
+			s.mux.Unlock()
 			s.connectHandles.Call(s, pkt.namespace)
 		}
 	case DISCONNECT:
