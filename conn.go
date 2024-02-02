@@ -29,9 +29,10 @@ import (
 )
 
 var (
-	errNotString = errors.New("Socket.IO: the first argument must be a event name string")
-	errRecvText  = errors.New("Socket.IO: got plaintext data when reconstructing a packet")
-	errRecvByte  = errors.New("Socket.IO: got binary data when not reconstructing a packet")
+	errMultipleOpen = errors.New("Socket.IO: socket was already opened")
+	errNotString    = errors.New("Socket.IO: the first argument must be a event name string")
+	errRecvText     = errors.New("Socket.IO: got plaintext data when reconstructing a packet")
+	errRecvByte     = errors.New("Socket.IO: got binary data when not reconstructing a packet")
 )
 
 type ConnectError struct {
@@ -57,8 +58,8 @@ type Socket struct {
 
 	mux       sync.RWMutex
 	status    int32
-	sid, pid  string
 	namespace string
+	sid, pid  string
 
 	packet               Packet
 	reconstructingAttach int
@@ -67,18 +68,18 @@ type Socket struct {
 	ackId   int
 	ackChan map[int]chan []any
 
-	listeners         map[string][]func(string, []any)
 	connectHandles    utils.HandlerList[*Socket, string]
 	disconnectHandles utils.HandlerList[*Socket, string]
 	errorHandles      utils.HandlerList[*Socket, error]
+	packetHandlers    utils.HandlerList[*Socket, *Packet]
+	messageHandlers   utils.HandlerList[string, []any]
 }
 
 func NewSocket(io *engine.Socket) (s *Socket) {
 	s = &Socket{
 		io: io,
 
-		ackChan:   make(map[int]chan []any),
-		listeners: make(map[string][]func(string, []any)),
+		ackChan: make(map[int]chan []any),
 	}
 
 	io.OnMessage(s.onMessage)
@@ -88,9 +89,6 @@ func NewSocket(io *engine.Socket) (s *Socket) {
 			s.onError(err)
 		}
 	})
-	// io.OnError(func(_ *engine.Socket, err error) {
-	// 	s.onError(err)
-	// })
 	return
 }
 
@@ -133,8 +131,38 @@ func (s *Socket) OnDisconnect(cb func(s *Socket, namespace string)) {
 	s.disconnectHandles.On(cb)
 }
 
+func (s *Socket) OnceDisconnect(cb func(s *Socket, namespace string)) {
+	s.disconnectHandles.On(cb)
+}
+
 func (s *Socket) OnError(cb func(s *Socket, err error)) {
 	s.errorHandles.On(cb)
+}
+
+func (s *Socket) OnceError(cb func(s *Socket, err error)) {
+	s.errorHandles.On(cb)
+}
+
+func (s *Socket) OnPacket(cb func(s *Socket, pkt *Packet)) {
+	s.packetHandlers.On(cb)
+}
+
+func (s *Socket) OncePacket(cb func(s *Socket, pkt *Packet)) {
+	s.packetHandlers.Once(cb)
+}
+
+func (s *Socket) OnMessage(cb func(event string, args []any)) {
+	s.messageHandlers.On(cb)
+}
+
+func (s *Socket) OnceMessage(cb func(event string, args []any)) {
+	s.messageHandlers.Once(cb)
+}
+
+func (s *Socket) Namespace() string {
+	s.mux.RLock()
+	defer s.mux.RUnlock()
+	return s.namespace
 }
 
 func (s *Socket) onError(err error) {
@@ -142,18 +170,19 @@ func (s *Socket) onError(err error) {
 }
 
 func (s *Socket) onEvent(pkt *Packet) {
+	if pkt.namespace != s.Namespace() {
+		return
+	}
+	s.packetHandlers.Call(s, pkt)
 	var arr []any
 	if err := pkt.UnmarshalData(&arr); err == nil {
 		if name, ok := arr[0].(string); ok {
-			if listeners, ok := s.listeners[name]; ok {
-				arr = arr[1:]
-				for _, h := range listeners {
-					h(name, arr)
-				}
-			}
+			s.messageHandlers.Call(name, arr)
 		} else {
-			err = errNotString
+			s.onError(errNotString)
 		}
+	} else {
+		s.onError(err)
 	}
 }
 
@@ -211,7 +240,8 @@ func (s *Socket) onMessage(_ *engine.Socket, data []byte) {
 	switch pkt.typ {
 	case CONNECT:
 		if s.status != SocketOpening {
-			panic("TODO: multiple namespaces not supported yet")
+			s.onError(errMultipleOpen)
+			return
 		}
 		var obj struct {
 			Sid string `json:"sid"`

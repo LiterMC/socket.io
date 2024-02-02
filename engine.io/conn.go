@@ -277,16 +277,32 @@ func (s *Socket) OnDisconnect(cb func(s *Socket, err error)) {
 	s.disconnectHandles.On(cb)
 }
 
+func (s *Socket) OnceDisconnect(cb func(s *Socket, err error)) {
+	s.disconnectHandles.Once(cb)
+}
+
 func (s *Socket) OnPong(cb func(s *Socket, data []byte)) {
 	s.pongHandles.On(cb)
+}
+
+func (s *Socket) OncePong(cb func(s *Socket, data []byte)) {
+	s.pongHandles.Once(cb)
 }
 
 func (s *Socket) OnBinary(cb func(s *Socket, data []byte)) {
 	s.binaryHandlers.On(cb)
 }
 
+func (s *Socket) OnceBinary(cb func(s *Socket, data []byte)) {
+	s.binaryHandlers.Once(cb)
+}
+
 func (s *Socket) OnMessage(cb func(s *Socket, data []byte)) {
 	s.messageHandles.On(cb)
+}
+
+func (s *Socket) OnceMessage(cb func(s *Socket, data []byte)) {
+	s.messageHandles.Once(cb)
 }
 
 func (s *Socket) wsCloseHandler(code int, text string) error {
