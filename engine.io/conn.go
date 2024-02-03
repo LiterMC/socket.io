@@ -21,10 +21,8 @@ package engine
 
 import (
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -83,14 +81,12 @@ type Socket struct {
 	maxPayload    int
 	reDialTimeout time.Duration
 
-	notifyCh chan struct{}
-	msgCh    chan *Packet
 	msgbuf   []*Packet
 }
 
 type Options struct {
 	Secure       bool
-	Host         string // <host>:<port>
+	Host         string // [<scheme>://]<host>:<port>
 	Path         string
 	ExtraQuery   url.Values
 	ExtraHeaders http.Header
@@ -129,8 +125,6 @@ func NewSocket(opts Options) (s *Socket, err error) {
 		Dialer:   WebsocketDialer,
 		opts:     opts,
 		url:      dialURL,
-		notifyCh: make(chan struct{}, 1),
-		msgCh:    make(chan *Packet, 0),
 	}
 	return
 }
@@ -184,8 +178,6 @@ func (s *Socket) dial(ctx context.Context) (err error) {
 	s.msgbuf = s.msgbuf[:0]
 	s.reDialTimeout = time.Second
 
-	wsconn.SetCloseHandler(s.wsCloseHandler)
-
 	return
 }
 
@@ -197,7 +189,7 @@ func (s *Socket) Dial(ctx context.Context) (err error) {
 	s.mux.Lock()
 	defer s.mux.Unlock()
 
-	if s.status.CompareAndSwap(SocketClosed, SocketOpening) || s.wsconn != nil {
+	if !s.status.CompareAndSwap(SocketClosed, SocketOpening) || s.wsconn != nil {
 		return ErrSocketConnected
 	}
 
@@ -220,7 +212,7 @@ func (s *Socket) reDial() (err error) {
 	s.mux.Lock()
 	defer s.mux.Unlock()
 
-	if s.status.CompareAndSwap(SocketClosed, SocketOpening) {
+	if !s.status.CompareAndSwap(SocketClosed, SocketOpening) {
 		return ErrSocketConnected
 	}
 
@@ -240,10 +232,7 @@ func (s *Socket) onMessage(data []byte) {
 
 func (s *Socket) onClose(err error) {
 	s.mux.RLock()
-	if wsconn := s.wsconn; wsconn != nil {
-		wsconn.SetCloseHandler(nil)
-		wsconn.Close()
-	}
+	s.wsconn.Close()
 	s.cancel(err)
 	dialCtx := s.dialCtx
 	s.mux.RUnlock()
@@ -317,20 +306,9 @@ func (s *Socket) OnceMessage(cb func(s *Socket, data []byte)) {
 	s.messageHandles.Once(cb)
 }
 
-func (s *Socket) wsCloseHandler(code int, text string) error {
-	s.status.Store(SocketClosed)
-
-	wer := &websocket.CloseError{Code: code, Text: text}
-	if code == websocket.CloseNormalClosure {
-		s.onClose(nil)
-	} else {
-		s.onClose(wer)
-	}
-	return nil
-}
-
 func (s *Socket) _reader(ctx context.Context, wsconn *websocket.Conn) {
 	defer wsconn.Close()
+	defer s.status.Store(SocketClosed)
 
 	openCh := make(chan struct{}, 0)
 	pingCh := make(chan struct{}, 1)
@@ -387,15 +365,6 @@ func (s *Socket) _reader(ctx context.Context, wsconn *websocket.Conn) {
 				s.onClose(err)
 				return
 			}
-			if len(buf) > 0 && buf[0] == 'b' {
-				n, err := base64.StdEncoding.Decode(buf, buf[1:])
-				if err != nil {
-					s.onClose(err)
-					return
-				}
-				s.binaryHandlers.Call(s, buf[:n])
-				continue
-			}
 		default:
 			continue
 		}
@@ -406,6 +375,8 @@ func (s *Socket) _reader(ctx context.Context, wsconn *websocket.Conn) {
 		}
 
 		switch pkt.typ {
+		case BINARY:
+			s.binaryHandlers.Call(s, pkt.body)
 		case OPEN:
 			if s.Status() != SocketOpening {
 				s.onClose(errMultipleOpen)
@@ -420,7 +391,7 @@ func (s *Socket) _reader(ctx context.Context, wsconn *websocket.Conn) {
 			}
 			if err := pkt.UnmarshalBody(&obj); err != nil {
 				s.onClose(err)
-				break
+				continue
 			}
 
 			s.mux.Lock()
@@ -455,16 +426,14 @@ func (s *Socket) _reader(ctx context.Context, wsconn *websocket.Conn) {
 }
 
 func sendPkt(wsconn *websocket.Conn, pkt *Packet) (err error) {
-	var w io.WriteCloser
-	if w, err = wsconn.NextWriter(websocket.TextMessage); err != nil {
+	if pkt.typ == BINARY {
+		return wsconn.WriteMessage(websocket.BinaryMessage, pkt.body)
+	}
+	var buf []byte
+	if buf, err = pkt.MarshalBinary(); err != nil {
 		return
 	}
-	defer w.Close()
-	_, err = pkt.WriteTo(w)
-	if err != nil {
-		return
-	}
-	return
+	return wsconn.WriteMessage(websocket.TextMessage, buf)
 }
 
 func (s *Socket) Close() error {
@@ -475,14 +444,13 @@ func (s *Socket) Close() error {
 }
 
 func (s *Socket) send(pkt *Packet) {
-	s.mux.Lock()
 	if s.Status() != SocketConnected {
+		s.mux.Lock()
+		defer s.mux.Unlock()
 		s.msgbuf = append(s.msgbuf, pkt)
-		s.mux.Unlock()
 		return
 	}
-	wsconn := s.wsconn
-	s.mux.Unlock()
+	wsconn := s.Conn()
 
 	if err := sendPkt(wsconn, pkt); err != nil {
 		s.onClose(err)

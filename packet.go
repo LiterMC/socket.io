@@ -59,7 +59,8 @@ type PacketType int8
 
 const (
 	unknownType PacketType = -1
-	CONNECT     PacketType = iota
+
+	CONNECT PacketType = iota
 	DISCONNECT
 	EVENT
 	ACK
@@ -131,7 +132,7 @@ func pktTypeFromByte(id byte) PacketType {
 type Packet struct {
 	typ       PacketType
 	namespace string
-	id        int
+	id        int // is the actual id + 1
 	data      []byte
 	attachs   [][]byte
 }
@@ -142,6 +143,14 @@ func (p *Packet) Type() PacketType {
 
 func (p *Packet) String() string {
 	return fmt.Sprintf("Packet(%s, %q, %d, <%d bytes>)", p.typ.String(), p.namespace, p.id, len(p.data))
+}
+
+func (p *Packet) Id() int {
+	return p.id - 1
+}
+
+func (p *Packet) SetId(id int) {
+	p.id = id + 1
 }
 
 func (p *Packet) SetData(args ...any) (err error) {
@@ -208,7 +217,7 @@ func (p *Packet) WriteTo(w io.Writer) (n int64, err error) {
 		n++
 	}
 	if p.id > 0 {
-		n0, err = w.Write(strconv.AppendInt(buf[:0], (int64)(p.id), 10))
+		n0, err = w.Write(strconv.AppendInt(buf[:0], (int64)(p.id-1), 10))
 		n += (int64)(n0)
 		if err != nil {
 			return
@@ -253,7 +262,7 @@ func (p *Packet) UnmarshalBinary(data []byte) (err error) {
 		if ok := len(data) > 0; ok && data[0] == '-' { // is <# of binary attachments>-
 			attachLen = num
 		} else { // assume it is <acknowledgment id>
-			p.id = num
+			p.id = num + 1
 			if ok {
 				goto READ_DATA
 			}

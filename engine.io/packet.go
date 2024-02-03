@@ -20,11 +20,10 @@
 package engine
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
-
-	"github.com/LiterMC/socket.io/internal/utils"
 )
 
 type UnexpectedPacketTypeError struct {
@@ -41,13 +40,16 @@ type PacketType int8
 
 const (
 	unknownType PacketType = -1
-	OPEN        PacketType = iota
+
+	OPEN PacketType = iota
 	CLOSE
 	PING
 	PONG
 	MESSAGE
 	UPGRADE
 	NOOP
+
+	BINARY PacketType = 'b'
 )
 
 func (t PacketType) String() string {
@@ -66,6 +68,8 @@ func (t PacketType) String() string {
 		return "UPGRADE"
 	case NOOP:
 		return "NOOP"
+	case BINARY:
+		return "BINARY"
 	}
 	return fmt.Sprintf("PacketType(%d)", (int8)(t))
 }
@@ -86,6 +90,8 @@ func (t PacketType) ID() byte {
 		return '5'
 	case NOOP:
 		return '6'
+	case BINARY:
+		return 'b'
 	}
 	panic(&UnexpectedPacketTypeError{t})
 }
@@ -106,6 +112,8 @@ func pktTypeFromByte(id byte) PacketType {
 		return UPGRADE
 	case '6':
 		return NOOP
+	case 'b':
+		return BINARY
 	}
 	return unknownType
 }
@@ -135,29 +143,33 @@ func (p *Packet) UnmarshalBody(ptr any) error {
 	return json.Unmarshal(p.body, &ptr)
 }
 
-func (p *Packet) WriteTo(w io.Writer) (n int64, err error) {
-	if err = utils.WriteByte(w, p.typ.ID()); err != nil {
-		return
-	}
-	n++
-	var n0 int
-	n0, err = w.Write(p.body)
-	n += (int64)(n0)
+func (p *Packet) MarshalBinary() (data []byte, err error) {
+	data = make([]byte, 1+len(p.body))
+	data[0] = p.typ.ID()
+	copy(data[1:], p.body)
 	return
 }
 
-func (p *Packet) UnmarshalBinary(data []byte) (err error) {
+func (p *Packet) UnmarshalBinary(data []byte) error {
 	if len(data) == 0 {
 		return io.EOF
 	}
 
 	typ := pktTypeFromByte(data[0])
 	if typ == unknownType {
-		err = &UnexpectedPacketTypeError{typ}
-		return
+		return &UnexpectedPacketTypeError{typ}
 	}
 	p.typ = typ
+	if typ == BINARY {
+		n, err := base64.StdEncoding.Decode(data, data[1:])
+		if err != nil {
+			return err
+		}
+		data = data[:n]
+	} else {
+		data = data[1:]
+	}
 	// reuse buffer if possible
-	p.body = append(p.body, data[1:]...)
-	return
+	p.body = append(p.body[:0], data...)
+	return nil
 }

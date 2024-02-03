@@ -56,10 +56,11 @@ const (
 type Socket struct {
 	io *engine.Socket
 
-	mux       sync.RWMutex
-	status    SocketStatus
-	sid, pid  string
-	namespace string
+	mux           sync.RWMutex
+	status        SocketStatus
+	sid, pid      string
+	namespace     string
+	autoReconnect bool
 
 	packet               Packet
 	reconstructingAttach int
@@ -73,6 +74,8 @@ type Socket struct {
 	errorHandles      utils.HandlerList[*Socket, error]
 	packetHandlers    utils.HandlerList[*Socket, *Packet]
 	messageHandlers   utils.HandlerList[string, []any]
+
+	msgbuf [][]byte
 }
 
 func NewSocket(io *engine.Socket) (s *Socket) {
@@ -82,13 +85,29 @@ func NewSocket(io *engine.Socket) (s *Socket) {
 		ackChan: make(map[int]chan []any),
 	}
 
-	io.OnMessage(s.onMessage)
+	shouldReconnect := false
+	io.OnConnect(func(*engine.Socket) {
+		s.mux.RLock()
+		reconnect := s.autoReconnect
+		s.mux.RUnlock()
+		if shouldReconnect && reconnect {
+			if err := s.send(&Packet{
+				typ:       CONNECT,
+				namespace: s.namespace,
+			}); err != nil {
+				s.onError(err)
+			}
+			shouldReconnect = false
+		}
+	})
 	io.OnDisconnect(func(_ *engine.Socket, err error) {
 		s.disconnected()
 		if err != nil {
+			shouldReconnect = true
 			s.onError(err)
 		}
 	})
+	io.OnMessage(s.onMessage)
 	return
 }
 
@@ -107,15 +126,18 @@ func (s *Socket) Status() SocketStatus {
 func (s *Socket) Connect(namespace string) (err error) {
 	s.mux.Lock()
 	defer s.mux.Unlock()
-	if s.status != SocketOpening {
+	if s.status != SocketClosed {
 		panic("Socket.IO: socket is already connected to a namespce, multiple namespaces is TODO")
 	}
+	s.namespace = namespace
 	if err = s.send(&Packet{
 		typ:       CONNECT,
 		namespace: namespace,
 	}); err != nil {
 		return
 	}
+	s.status = SocketOpening
+	s.autoReconnect = true
 	return
 }
 
@@ -175,12 +197,13 @@ func (s *Socket) Close() (err error) {
 	s.mux.Lock()
 	defer s.mux.Unlock()
 
+	s.autoReconnect = false
 	if s.status == SocketClosed {
 		return
 	}
 
 	err = s.send(&Packet{
-		typ: DISCONNECT,
+		typ:       DISCONNECT,
 		namespace: s.namespace,
 	})
 	s.status = SocketClosed
@@ -210,16 +233,21 @@ func (s *Socket) onEvent(pkt *Packet) {
 
 func (s *Socket) onAck(pkt *Packet) {
 	s.ackMux.Lock()
-	ch, ok := s.ackChan[pkt.id]
-	delete(s.ackChan, pkt.id)
+	id := pkt.Id()
+	ch, ok := s.ackChan[id]
+	delete(s.ackChan, id)
 	s.ackMux.Unlock()
 	if ok {
-		var arr []any
+		var arr [][]any
 		if err := pkt.UnmarshalData(&arr); err != nil {
 			s.onError(err)
 			return
 		}
-		ch <- arr
+		if len(arr) > 0 {
+			ch <- arr[0]
+		} else {
+			ch <- nil
+		}
 	}
 }
 
@@ -261,8 +289,10 @@ func (s *Socket) onMessage(_ *engine.Socket, data []byte) {
 	}
 	switch pkt.typ {
 	case CONNECT:
-		if s.status != SocketOpening {
-			s.onError(errMultipleOpen)
+		s.mux.RLock()
+		ok := s.status == SocketOpening && pkt.namespace == s.namespace
+		s.mux.RUnlock()
+		if !ok {
 			return
 		}
 		var obj struct {
@@ -274,7 +304,10 @@ func (s *Socket) onMessage(_ *engine.Socket, data []byte) {
 			s.status = SocketConnected
 			s.sid = obj.Sid
 			s.pid = obj.Pid
-			s.namespace = pkt.namespace
+			for _, bts := range s.msgbuf {
+				s.io.Emit(bts)
+			}
+			s.msgbuf = s.msgbuf[:0]
 			s.mux.Unlock()
 			s.connectHandles.Call(s, pkt.namespace)
 		}
@@ -306,16 +339,29 @@ func (s *Socket) send(pkt *Packet) (err error) {
 	if _, err = pkt.WriteTo(&buf); err != nil {
 		return
 	}
-	s.io.Emit(buf.Bytes())
+	bts := buf.Bytes()
+	if s.io.Status() == engine.SocketConnected {
+		switch pkt.typ {
+		case EVENT, BINARY_EVENT, ACK, BINARY_ACK:
+			s.mux.Lock()
+			s.msgbuf = append(s.msgbuf, bts)
+			s.mux.Unlock()
+		}
+	} else {
+		s.io.Emit(bts)
+	}
 	return
 }
 
 func (s *Socket) Emit(event string, args ...any) (err error) {
 	pkt := Packet{
-		typ: EVENT,
-		// namespace: s.namespace,
+		typ:       EVENT,
+		namespace: s.namespace,
 	}
-	if err = pkt.SetData(args...); err != nil {
+	argsAll := make([]any, 1+len(args))
+	argsAll[0] = event
+	copy(argsAll[1:], args)
+	if err = pkt.SetData(argsAll...); err != nil {
 		return
 	}
 	return s.send(&pkt)
@@ -326,7 +372,7 @@ func (s *Socket) assignAckId() (id int, res <-chan []any) {
 	defer s.ackMux.Unlock()
 	for {
 		id = s.ackId
-		s.ackId = (s.ackId + 1) & 0x7fffffff
+		s.ackId = (s.ackId + 1) & 0x3fffffff
 		if _, ok := s.ackChan[id]; !ok {
 			break
 		}
@@ -337,21 +383,24 @@ func (s *Socket) assignAckId() (id int, res <-chan []any) {
 	return
 }
 
-func (s *Socket) EmitWithAck(event string, args ...any) (res <-chan []any, err error) {
+func (s *Socket) EmitWithAck(event string, args ...any) (<-chan []any, error) {
 	pkt := Packet{
-		typ: EVENT,
-		// namespace: s.namespace,
+		typ:       EVENT,
+		namespace: s.namespace,
 	}
-	if err = pkt.SetData(args...); err != nil {
-		return
+	argsAll := make([]any, 1+len(args))
+	argsAll[0] = event
+	copy(argsAll[1:], args)
+	if err := pkt.SetData(argsAll...); err != nil {
+		return nil, err
 	}
-	pkt.id, res = s.assignAckId()
-	if err = s.send(&pkt); err != nil {
+	id, res := s.assignAckId()
+	pkt.SetId(id)
+	if err := s.send(&pkt); err != nil {
 		s.ackMux.Lock()
-		delete(s.ackChan, pkt.id)
+		delete(s.ackChan, id)
 		s.ackMux.Unlock()
-		res = nil
-		return
+		return nil, err
 	}
-	return
+	return res, nil
 }
