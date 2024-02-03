@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"errors"
 	"sync"
+	"sync/atomic"
 
 	"github.com/LiterMC/socket.io/engine.io"
 	"github.com/LiterMC/socket.io/internal/utils"
@@ -45,7 +46,7 @@ func (e *ConnectError) Error() string {
 	return "Socket.IO: connect error: " + e.Reason
 }
 
-type SocketStatus int32
+type SocketStatus = int32
 
 const (
 	SocketClosed SocketStatus = iota
@@ -57,7 +58,7 @@ type Socket struct {
 	io *engine.Socket
 
 	mux           sync.RWMutex
-	status        SocketStatus
+	status        atomic.Int32
 	sid, pid      string
 	namespace     string
 	autoReconnect bool
@@ -118,15 +119,13 @@ func (s *Socket) ID() string {
 }
 
 func (s *Socket) Status() SocketStatus {
-	s.mux.RLock()
-	defer s.mux.RUnlock()
-	return s.status
+	return s.status.Load()
 }
 
 func (s *Socket) Connect(namespace string) (err error) {
 	s.mux.Lock()
 	defer s.mux.Unlock()
-	if s.status != SocketClosed {
+	if !s.status.CompareAndSwap(SocketClosed, SocketOpening) {
 		panic("Socket.IO: socket is already connected to a namespce, multiple namespaces is TODO")
 	}
 	s.namespace = namespace
@@ -134,17 +133,15 @@ func (s *Socket) Connect(namespace string) (err error) {
 		typ:       CONNECT,
 		namespace: namespace,
 	}); err != nil {
+		s.status.Store(SocketClosed)
 		return
 	}
-	s.status = SocketOpening
 	s.autoReconnect = true
 	return
 }
 
 func (s *Socket) disconnected() {
-	s.mux.Lock()
-	defer s.mux.Unlock()
-	s.status = SocketClosed
+	s.status.Store(SocketClosed)
 }
 
 func (s *Socket) OnConnect(cb func(s *Socket, namespace string)) {
@@ -194,11 +191,15 @@ func (s *Socket) Namespace() string {
 }
 
 func (s *Socket) Close() (err error) {
+	if s.status.Load() == SocketClosed {
+		return
+	}
+
 	s.mux.Lock()
 	defer s.mux.Unlock()
 
 	s.autoReconnect = false
-	if s.status == SocketClosed {
+	if s.status.Load() == SocketClosed {
 		return
 	}
 
@@ -206,7 +207,7 @@ func (s *Socket) Close() (err error) {
 		typ:       DISCONNECT,
 		namespace: s.namespace,
 	})
-	s.status = SocketClosed
+	s.status.Store(SocketClosed)
 	return
 }
 
@@ -289,9 +290,7 @@ func (s *Socket) onMessage(_ *engine.Socket, data []byte) {
 	}
 	switch pkt.typ {
 	case CONNECT:
-		s.mux.RLock()
-		ok := s.status == SocketOpening && pkt.namespace == s.namespace
-		s.mux.RUnlock()
+		ok := s.Status() == SocketOpening && pkt.namespace == s.namespace
 		if !ok {
 			return
 		}
@@ -301,13 +300,13 @@ func (s *Socket) onMessage(_ *engine.Socket, data []byte) {
 		}
 		if err := pkt.UnmarshalData(&obj); err == nil {
 			s.mux.Lock()
-			s.status = SocketConnected
 			s.sid = obj.Sid
 			s.pid = obj.Pid
 			for _, bts := range s.msgbuf {
 				s.io.Emit(bts)
 			}
 			s.msgbuf = s.msgbuf[:0]
+			s.status.Store(SocketConnected)
 			s.mux.Unlock()
 			s.connectHandles.Call(s, pkt.namespace)
 		}
@@ -340,15 +339,21 @@ func (s *Socket) send(pkt *Packet) (err error) {
 		return
 	}
 	bts := buf.Bytes()
-	if s.io.Status() == engine.SocketConnected {
+	if s.Status() == SocketConnected {
+		s.io.Emit(bts)
+	} else {
 		switch pkt.typ {
 		case EVENT, BINARY_EVENT, ACK, BINARY_ACK:
 			s.mux.Lock()
 			s.msgbuf = append(s.msgbuf, bts)
 			s.mux.Unlock()
+		case CONNECT:
+			s.io.Emit(bts)
+		default:
+			if s.io.Connected() {
+				s.io.Emit(bts)
+			}
 		}
-	} else {
-		s.io.Emit(bts)
 	}
 	return
 }

@@ -72,6 +72,9 @@ type Socket struct {
 	pongHandles       utils.HandlerList[*Socket, []byte]
 	binaryHandlers    utils.HandlerList[*Socket, []byte]
 	messageHandles    utils.HandlerList[*Socket, []byte]
+	// debug handler
+	recvHandles utils.HandlerList[*Socket, []byte]
+	sendHandles utils.HandlerList[*Socket, []byte]
 
 	wsconn        *websocket.Conn
 	status        atomic.Int32
@@ -81,7 +84,7 @@ type Socket struct {
 	maxPayload    int
 	reDialTimeout time.Duration
 
-	msgbuf   []*Packet
+	msgbuf []*Packet
 }
 
 type Options struct {
@@ -122,9 +125,9 @@ func NewSocket(opts Options) (s *Socket, err error) {
 	dialURL.RawQuery = query.Encode()
 
 	s = &Socket{
-		Dialer:   WebsocketDialer,
-		opts:     opts,
-		url:      dialURL,
+		Dialer: WebsocketDialer,
+		opts:   opts,
+		url:    dialURL,
 	}
 	return
 }
@@ -306,6 +309,14 @@ func (s *Socket) OnceMessage(cb func(s *Socket, data []byte)) {
 	s.messageHandles.Once(cb)
 }
 
+func (s *Socket) OnRecv(cb func(s *Socket, data []byte)) {
+	s.recvHandles.On(cb)
+}
+
+func (s *Socket) OnSend(cb func(s *Socket, data []byte)) {
+	s.sendHandles.On(cb)
+}
+
 func (s *Socket) _reader(ctx context.Context, wsconn *websocket.Conn) {
 	defer wsconn.Close()
 	defer s.status.Store(SocketClosed)
@@ -369,6 +380,8 @@ func (s *Socket) _reader(ctx context.Context, wsconn *websocket.Conn) {
 			continue
 		}
 
+		s.recvHandles.Call(s, buf)
+
 		if err = pkt.UnmarshalBinary(buf); err != nil {
 			s.onClose(err)
 			return
@@ -400,7 +413,7 @@ func (s *Socket) _reader(ctx context.Context, wsconn *websocket.Conn) {
 			s.pingTimeout = (time.Duration)(obj.PingTimeout) * time.Millisecond
 			s.maxPayload = obj.MaxPayload
 			for _, pkt := range s.msgbuf {
-				sendPkt(wsconn, pkt)
+				s.sendPkt(wsconn, pkt)
 			}
 			s.msgbuf = s.msgbuf[:0]
 			s.status.Store(SocketConnected)
@@ -425,7 +438,7 @@ func (s *Socket) _reader(ctx context.Context, wsconn *websocket.Conn) {
 	}
 }
 
-func sendPkt(wsconn *websocket.Conn, pkt *Packet) (err error) {
+func (s *Socket) sendPkt(wsconn *websocket.Conn, pkt *Packet) (err error) {
 	if pkt.typ == BINARY {
 		return wsconn.WriteMessage(websocket.BinaryMessage, pkt.body)
 	}
@@ -433,6 +446,7 @@ func sendPkt(wsconn *websocket.Conn, pkt *Packet) (err error) {
 	if buf, err = pkt.MarshalBinary(); err != nil {
 		return
 	}
+	s.sendHandles.Call(s, buf)
 	return wsconn.WriteMessage(websocket.TextMessage, buf)
 }
 
@@ -452,7 +466,7 @@ func (s *Socket) send(pkt *Packet) {
 	}
 	wsconn := s.Conn()
 
-	if err := sendPkt(wsconn, pkt); err != nil {
+	if err := s.sendPkt(wsconn, pkt); err != nil {
 		s.onClose(err)
 	}
 	return
