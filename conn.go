@@ -86,7 +86,7 @@ func NewSocket(io *engine.Socket) (s *Socket) {
 		ackChan: make(map[int]chan []any),
 	}
 
-	shouldReconnect := false
+	shouldReconnect := true
 	io.OnConnect(func(*engine.Socket) {
 		s.mux.RLock()
 		reconnect := s.autoReconnect
@@ -122,19 +122,26 @@ func (s *Socket) Status() SocketStatus {
 	return s.status.Load()
 }
 
+func (s *Socket) sendConnPkt() error {
+	return s.send(&Packet{
+		typ:       CONNECT,
+		namespace: s.namespace,
+	})
+}
+
 func (s *Socket) Connect(namespace string) (err error) {
 	s.mux.Lock()
 	defer s.mux.Unlock()
+
 	if !s.status.CompareAndSwap(SocketClosed, SocketOpening) {
 		panic("Socket.IO: socket is already connected to a namespce, multiple namespaces is TODO")
 	}
 	s.namespace = namespace
-	if err = s.send(&Packet{
-		typ:       CONNECT,
-		namespace: namespace,
-	}); err != nil {
-		s.status.Store(SocketClosed)
-		return
+	if s.io.Connected() {
+		if err = s.sendConnPkt(); err != nil {
+			s.status.Store(SocketClosed)
+			return
+		}
 	}
 	s.autoReconnect = true
 	return
@@ -347,8 +354,6 @@ func (s *Socket) send(pkt *Packet) (err error) {
 			s.mux.Lock()
 			s.msgbuf = append(s.msgbuf, bts)
 			s.mux.Unlock()
-		case CONNECT:
-			s.io.Emit(bts)
 		default:
 			if s.io.Connected() {
 				s.io.Emit(bts)
