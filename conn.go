@@ -91,7 +91,15 @@ func WithAuth(auth map[string]any) Option {
 func WithAuthToken(token string) Option {
 	return func(s *Socket) {
 		s.auth = map[string]any{
-			"auth": token,
+			"token": token,
+		}
+	}
+}
+
+func WithAuthTokenFn(tokenGen func() string) Option {
+	return func(s *Socket) {
+		s.auth = map[string]any{
+			"token": tokenGen,
 		}
 	}
 }
@@ -101,6 +109,10 @@ func NewSocket(io *engine.Socket, options ...Option) (s *Socket) {
 		io: io,
 
 		ackChan: make(map[int]chan []any),
+	}
+
+	for _, opt := range options {
+		opt(s)
 	}
 
 	shouldReconnect := true
@@ -146,7 +158,19 @@ func (s *Socket) sendConnPkt() error {
 		namespace: s.namespace,
 	}
 	if s.auth != nil {
-		if err := pkt.SetData(s.auth); err != nil {
+		data := make(map[string]any)
+		for k, v := range s.auth {
+			switch v := v.(type) {
+			// TODO: support any function type use reflect
+			case func() string:
+				data[k] = v()
+			case func() any:
+				data[k] = v()
+			default:
+				data[k] = v
+			}
+		}
+		if err := pkt.SetData(data); err != nil {
 			return err
 		}
 	}
