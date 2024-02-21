@@ -69,6 +69,8 @@ type Socket struct {
 
 	connectHandles    utils.HandlerList[*Socket, struct{}]
 	disconnectHandles utils.HandlerList[*Socket, error]
+	dialErrorHandles  utils.HandlerList[*Socket, error]
+	reconnectHandles  utils.HandlerList[*Socket, struct{}]
 	pongHandles       utils.HandlerList[*Socket, []byte]
 	binaryHandlers    utils.HandlerList[*Socket, []byte]
 	messageHandles    utils.HandlerList[*Socket, []byte]
@@ -174,6 +176,7 @@ func (s *Socket) dial(ctx context.Context) (err error) {
 		wsconn, _, err = s.Dialer.DialContext(ctx, s.url.String(), s.opts.ExtraHeaders)
 	}
 	if err != nil {
+		s.dialErrorHandles.Call(s, err)
 		return
 	}
 	s.ctx, s.cancel = context.WithCancelCause(s.dialCtx)
@@ -225,6 +228,8 @@ func (s *Socket) reDial() (err error) {
 	}
 
 	go s._reader(s.ctx, s.wsconn)
+
+	s.reconnectHandles.Call(s, struct{}{})
 
 	return
 }
@@ -283,6 +288,16 @@ func (s *Socket) OnDisconnect(cb func(s *Socket, err error)) {
 
 func (s *Socket) OnceDisconnect(cb func(s *Socket, err error)) {
 	s.disconnectHandles.Once(cb)
+}
+
+func (s *Socket) OnDialError(cb func(s *Socket, err error)) {
+	s.dialErrorHandles.On(cb)
+}
+
+func (s *Socket) OnReconnect(cb func(s *Socket)) {
+	s.reconnectHandles.On(func(s *Socket, _ struct{}) {
+		cb(s)
+	})
 }
 
 func (s *Socket) OnPong(cb func(s *Socket, data []byte)) {
