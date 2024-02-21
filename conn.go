@@ -62,6 +62,7 @@ type Socket struct {
 	sid, pid      string
 	namespace     string
 	autoReconnect bool
+	auth          map[string]any
 
 	packet               Packet
 	reconstructingAttach int
@@ -79,7 +80,23 @@ type Socket struct {
 	msgbuf [][]byte
 }
 
-func NewSocket(io *engine.Socket) (s *Socket) {
+type Option = func(*Socket)
+
+func WithAuth(auth map[string]any) Option {
+	return func(s *Socket) {
+		s.auth = auth
+	}
+}
+
+func WithAuthToken(token string) Option {
+	return func(s *Socket) {
+		s.auth = map[string]any{
+			"auth": token,
+		}
+	}
+}
+
+func NewSocket(io *engine.Socket, options ...Option) (s *Socket) {
 	s = &Socket{
 		io: io,
 
@@ -92,10 +109,7 @@ func NewSocket(io *engine.Socket) (s *Socket) {
 		reconnect := s.autoReconnect
 		s.mux.RUnlock()
 		if shouldReconnect && reconnect {
-			if err := s.send(&Packet{
-				typ:       CONNECT,
-				namespace: s.namespace,
-			}); err != nil {
+			if err := s.sendConnPkt(); err != nil {
 				s.onError(err)
 			}
 			shouldReconnect = false
@@ -127,10 +141,16 @@ func (s *Socket) IO() *engine.Socket {
 }
 
 func (s *Socket) sendConnPkt() error {
-	return s.send(&Packet{
+	pkt := &Packet{
 		typ:       CONNECT,
 		namespace: s.namespace,
-	})
+	}
+	if s.auth != nil {
+		if err := pkt.SetData(s.auth); err != nil {
+			return err
+		}
+	}
+	return s.send(pkt)
 }
 
 func (s *Socket) Connect(namespace string) (err error) {
