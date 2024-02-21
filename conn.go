@@ -122,6 +122,10 @@ func (s *Socket) Status() SocketStatus {
 	return s.status.Load()
 }
 
+func (s *Socket) IO() *engine.Socket {
+	return s.io
+}
+
 func (s *Socket) sendConnPkt() error {
 	return s.send(&Packet{
 		typ:       CONNECT,
