@@ -71,11 +71,12 @@ type Socket struct {
 	ackId   int
 	ackChan map[int]chan []any
 
-	connectHandles    utils.HandlerList[*Socket, string]
-	disconnectHandles utils.HandlerList[*Socket, string]
-	errorHandles      utils.HandlerList[*Socket, error]
-	packetHandlers    utils.HandlerList[*Socket, *Packet]
-	messageHandlers   utils.HandlerList[string, []any]
+	connectHandles       utils.HandlerList[*Socket, string]
+	disconnectHandles    utils.HandlerList[*Socket, string]
+	beforeConnectHandles utils.HandlerList[*Socket, struct{}]
+	errorHandles         utils.HandlerList[*Socket, error]
+	packetHandlers       utils.HandlerList[*Socket, *Packet]
+	messageHandlers      utils.HandlerList[string, []any]
 
 	msgbuf [][]byte
 }
@@ -123,8 +124,9 @@ func NewSocket(io *engine.Socket, options ...Option) (s *Socket) {
 		if shouldReconnect && reconnect {
 			if err := s.sendConnPkt(); err != nil {
 				s.onError(err)
+			} else {
+				shouldReconnect = false
 			}
-			shouldReconnect = false
 		}
 	})
 	io.OnDisconnect(func(_ *engine.Socket, err error) {
@@ -153,6 +155,7 @@ func (s *Socket) IO() *engine.Socket {
 }
 
 func (s *Socket) sendConnPkt() error {
+	s.beforeConnectHandles.Call(s, struct{}{})
 	pkt := &Packet{
 		typ:       CONNECT,
 		namespace: s.namespace,
@@ -213,6 +216,12 @@ func (s *Socket) OnDisconnect(cb func(s *Socket, namespace string)) {
 
 func (s *Socket) OnceDisconnect(cb func(s *Socket, namespace string)) {
 	s.disconnectHandles.On(cb)
+}
+
+func (s *Socket) OnBeforeConnect(cb func(s *Socket)) {
+	s.beforeConnectHandles.On(func(s *Socket, _ struct{}) {
+		cb(s)
+	})
 }
 
 func (s *Socket) OnError(cb func(s *Socket, err error)) {
