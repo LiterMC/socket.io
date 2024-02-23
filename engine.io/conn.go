@@ -78,13 +78,14 @@ type Socket struct {
 	recvHandles utils.HandlerList[*Socket, []byte]
 	sendHandles utils.HandlerList[*Socket, []byte]
 
-	wsconn        *websocket.Conn
-	status        atomic.Int32
-	sid           string
-	pingInterval  time.Duration
-	pingTimeout   time.Duration
-	maxPayload    int
-	reDialTimeout time.Duration
+	wsconn         *websocket.Conn
+	status         atomic.Int32
+	sid            string
+	pingInterval   time.Duration
+	pingTimeout    time.Duration
+	maxPayload     int
+	reDialTimeout  time.Duration
+	reconnectTimer atomic.Pointer[time.Timer]
 
 	msgbuf []*Packet
 }
@@ -238,6 +239,31 @@ func (s *Socket) onMessage(data []byte) {
 	s.messageHandles.Call(s, data)
 }
 
+func (s *Socket) nextReconnect(ctx context.Context) {
+	s.mux.Lock()
+	defer s.mux.Unlock()
+	if timer := s.reconnectTimer.Swap(nil); timer != nil {
+		timer.Stop()
+	}
+
+	if s.reDialTimeout < time.Minute*5 {
+		s.reDialTimeout = s.reDialTimeout * 2
+	}
+	stop := context.AfterFunc(ctx, func() {
+		if timer := s.reconnectTimer.Swap(nil); timer != nil {
+			timer.Stop()
+		}
+	})
+	s.reconnectTimer.Store(time.AfterFunc(s.reDialTimeout, func() {
+		s.reconnectTimer.Store(nil)
+		stop()
+		if err := s.reDial(); err != nil {
+			s.dialErrorHandles.Call(s, err)
+			s.nextReconnect(ctx)
+		}
+	}))
+}
+
 func (s *Socket) onClose(err error) {
 	s.mux.RLock()
 	s.wsconn.Close()
@@ -246,17 +272,7 @@ func (s *Socket) onClose(err error) {
 	s.mux.RUnlock()
 
 	if s.status.Swap(SocketClosed) != SocketClosed && err != nil {
-		if s.reDialTimeout < time.Minute*5 {
-			s.reDialTimeout = s.reDialTimeout * 2
-		}
-		go func(ctx context.Context, timeout time.Duration) {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(timeout):
-				s.reDial()
-			}
-		}(dialCtx, s.reDialTimeout)
+		s.nextReconnect(dialCtx)
 	}
 
 	s.disconnectHandles.Call(s, err)
