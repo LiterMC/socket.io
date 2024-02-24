@@ -116,23 +116,19 @@ func NewSocket(io *engine.Socket, options ...Option) (s *Socket) {
 		opt(s)
 	}
 
-	shouldReconnect := true
 	io.OnConnect(func(*engine.Socket) {
 		s.mux.RLock()
 		reconnect := s.autoReconnect
 		s.mux.RUnlock()
-		if shouldReconnect && reconnect {
+		if reconnect {
 			if err := s.sendConnPkt(); err != nil {
 				s.onError(err)
-			} else {
-				shouldReconnect = false
 			}
 		}
 	})
 	io.OnDisconnect(func(_ *engine.Socket, err error) {
 		s.disconnected()
 		if err != nil {
-			shouldReconnect = true
 			s.onError(err)
 		}
 	})
