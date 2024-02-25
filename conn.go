@@ -121,8 +121,10 @@ func NewSocket(io *engine.Socket, options ...Option) (s *Socket) {
 		reconnect := s.autoReconnect
 		s.mux.RUnlock()
 		if reconnect {
-			if err := s.sendConnPkt(); err != nil {
-				s.onError(err)
+			if s.status.CompareAndSwap(SocketClosed, SocketOpening) {
+				if err := s.sendConnPkt(); err != nil {
+					s.onError(err)
+				}
 			}
 		}
 	})
