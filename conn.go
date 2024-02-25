@@ -283,7 +283,7 @@ func (s *Socket) onEvent(pkt *Packet) {
 	var arr []any
 	if err := pkt.UnmarshalData(&arr); err == nil {
 		if name, ok := arr[0].(string); ok {
-			s.messageHandlers.Call(name, arr)
+			s.messageHandlers.Call(name, arr[1:])
 		} else {
 			s.onError(errNotString)
 		}
