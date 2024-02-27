@@ -258,7 +258,6 @@ func (s *Socket) nextReconnect(ctx context.Context) {
 		s.reconnectTimer.Store(nil)
 		stop()
 		if err := s.reDial(); err != nil {
-			s.dialErrorHandles.Call(s, err)
 			s.nextReconnect(ctx)
 		}
 	}))
