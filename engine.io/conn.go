@@ -264,17 +264,20 @@ func (s *Socket) nextReconnect(ctx context.Context) {
 }
 
 func (s *Socket) onClose(err error) {
+	if s.status.Swap(SocketClosed) == SocketClosed {
+		return
+	}
+
 	s.mux.RLock()
 	s.wsconn.Close()
 	s.cancel(err)
 	dialCtx := s.dialCtx
 	s.mux.RUnlock()
 
-	if s.status.Swap(SocketClosed) != SocketClosed && err != nil {
+	s.disconnectHandles.Call(s, err)
+	if err != nil {
 		s.nextReconnect(dialCtx)
 	}
-
-	s.disconnectHandles.Call(s, err)
 }
 
 func (s *Socket) OnConnect(cb func(s *Socket)) {

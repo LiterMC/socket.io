@@ -213,7 +213,7 @@ func (s *Socket) OnDisconnect(cb func(s *Socket, namespace string)) {
 }
 
 func (s *Socket) OnceDisconnect(cb func(s *Socket, namespace string)) {
-	s.disconnectHandles.On(cb)
+	s.disconnectHandles.Once(cb)
 }
 
 func (s *Socket) OnBeforeConnect(cb func(s *Socket)) {
@@ -227,7 +227,7 @@ func (s *Socket) OnError(cb func(s *Socket, err error)) {
 }
 
 func (s *Socket) OnceError(cb func(s *Socket, err error)) {
-	s.errorHandles.On(cb)
+	s.errorHandles.Once(cb)
 }
 
 func (s *Socket) OnPacket(cb func(s *Socket, pkt *Packet)) {
