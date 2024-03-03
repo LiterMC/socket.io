@@ -191,6 +191,8 @@ func (s *Socket) Connect(namespace string) (err error) {
 			s.status.Store(SocketClosed)
 			return
 		}
+	} else {
+		s.status.Store(SocketClosed)
 	}
 	s.autoReconnect = true
 	return
