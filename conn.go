@@ -362,18 +362,22 @@ func (s *Socket) onMessage(_ *engine.Socket, data []byte) {
 			Sid string `json:"sid"`
 			Pid string `json:"pid"`
 		}
-		if err := pkt.UnmarshalData(&obj); err == nil {
-			s.mux.Lock()
-			s.sid = obj.Sid
-			s.pid = obj.Pid
-			for _, bts := range s.msgbuf {
-				s.io.Emit(bts)
-			}
-			s.msgbuf = s.msgbuf[:0]
-			s.status.Store(SocketConnected)
-			s.mux.Unlock()
-			s.connectHandles.Call(s, pkt.namespace)
+		if err := pkt.UnmarshalData(&obj); err != nil {
+			return
 		}
+		s.mux.Lock()
+		if true && len(s.msgbuf) == 0 { // TODO: socket.io retrive
+			s.ackId = 0
+		}
+		s.sid = obj.Sid
+		s.pid = obj.Pid
+		for _, bts := range s.msgbuf {
+			s.io.Emit(bts)
+		}
+		s.msgbuf = s.msgbuf[:0]
+		s.status.Store(SocketConnected)
+		s.mux.Unlock()
+		s.connectHandles.Call(s, pkt.namespace)
 	case DISCONNECT:
 		s.disconnected()
 		s.disconnectHandles.Call(s, pkt.namespace)
@@ -451,7 +455,7 @@ func (s *Socket) assignAckId() (id int, res <-chan []any) {
 }
 
 func (s *Socket) EmitWithAck(event string, args ...any) (<-chan []any, error) {
-	pkt := Packet{
+	pkt := &Packet{
 		typ:       EVENT,
 		namespace: s.namespace,
 	}
@@ -463,7 +467,7 @@ func (s *Socket) EmitWithAck(event string, args ...any) (<-chan []any, error) {
 	}
 	id, res := s.assignAckId()
 	pkt.SetId(id)
-	if err := s.send(&pkt); err != nil {
+	if err := s.send(pkt); err != nil {
 		s.ackMux.Lock()
 		delete(s.ackChan, id)
 		s.ackMux.Unlock()

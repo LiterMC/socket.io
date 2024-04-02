@@ -355,24 +355,29 @@ func (s *Socket) _reader(ctx context.Context, wsconn *websocket.Conn) {
 	defer s.status.Store(SocketClosed)
 
 	openCh := make(chan struct{}, 0)
-	pingCh := make(chan struct{}, 1)
+
+	pingTimer := time.NewTimer(time.Minute)
+	pingTimer.Stop()
 
 	go func() {
 		defer wsconn.Close()
 		select {
 		case <-ctx.Done():
 			return
-		case <-openCh:
+		case <-openCh: // wait for the open packet
 		}
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(s.pingInterval + s.pingTimeout):
-				s.onClose(ErrPingTimeout)
-				return
-			case <-pingCh:
-			}
+
+		// clear timer
+		pingTimer.Stop()
+		select {
+		case <-pingTimer.C:
+		default:
+		}
+
+		select {
+		case <-ctx.Done():
+		case <-pingTimer.C:
+			s.onClose(ErrPingTimeout)
 		}
 	}()
 
@@ -391,10 +396,7 @@ func (s *Socket) _reader(ctx context.Context, wsconn *websocket.Conn) {
 		}
 
 		// reset ping timer
-		select {
-		case pingCh <- struct{}{}:
-		default:
-		}
+		pingTimer.Reset(s.pingInterval + s.pingTimeout)
 
 		switch code {
 		case websocket.BinaryMessage:
