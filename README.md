@@ -7,4 +7,5 @@ This package support **websocket transport only**
 
 ### TODO
 
+- [ ] Client reconnect with same sid
 - [ ] Server implementation
