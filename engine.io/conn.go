@@ -69,7 +69,7 @@ type Socket struct {
 
 	connectHandles    utils.HandlerList[*Socket, struct{}]
 	disconnectHandles utils.HandlerList[*Socket, error]
-	dialErrorHandles  utils.HandlerList[*Socket, error]
+	dialErrorHandles  utils.HandlerList[*Socket, *DialErrorContext]
 	reconnectHandles  utils.HandlerList[*Socket, struct{}]
 	pongHandles       utils.HandlerList[*Socket, []byte]
 	binaryHandlers    utils.HandlerList[*Socket, []byte]
@@ -84,6 +84,7 @@ type Socket struct {
 	pingInterval   time.Duration
 	pingTimeout    time.Duration
 	maxPayload     int
+	reDialCount    int
 	reDialTimeout  time.Duration
 	reconnectTimer atomic.Pointer[time.Timer]
 
@@ -167,6 +168,28 @@ func (s *Socket) URL() *url.URL {
 	return &s.url
 }
 
+type DialErrorContext struct {
+	count  int
+	err    error
+	reDial bool
+}
+
+func (ctx *DialErrorContext) Count() int {
+	return ctx.count
+}
+
+func (ctx *DialErrorContext) Err() error {
+	return ctx.err
+}
+
+func (ctx *DialErrorContext) ReDial() bool {
+	return ctx.reDial
+}
+
+func (ctx *DialErrorContext) CancelReDial() {
+	ctx.reDial = true
+}
+
 func (s *Socket) dial(ctx context.Context) (err error) {
 	var wsconn *websocket.Conn
 	if s.opts.DialTimeout > 0 {
@@ -177,12 +200,12 @@ func (s *Socket) dial(ctx context.Context) (err error) {
 		wsconn, _, err = s.Dialer.DialContext(ctx, s.url.String(), s.opts.ExtraHeaders)
 	}
 	if err != nil {
-		s.dialErrorHandles.Call(s, err)
 		return
 	}
 	s.ctx, s.cancel = context.WithCancelCause(s.dialCtx)
 	s.wsconn = wsconn
 	s.msgbuf = s.msgbuf[:0]
+	s.reDialCount = 0
 	s.reDialTimeout = time.Second
 
 	return
@@ -203,6 +226,10 @@ func (s *Socket) Dial(ctx context.Context) (err error) {
 	s.dialCtx = ctx
 	if err = s.dial(ctx); err != nil {
 		s.status.Store(SocketClosed)
+		s.dialErrorHandles.Call(s, &DialErrorContext{
+			count: -1,
+			err:   err,
+		})
 		return
 	}
 
@@ -224,7 +251,12 @@ func (s *Socket) reDial() (err error) {
 	}
 
 	if err = s.dial(s.dialCtx); err != nil {
+		s.reDialCount++
 		s.status.Store(SocketClosed)
+		s.dialErrorHandles.Call(s, &DialErrorContext{
+			count: s.reDialCount,
+			err:   err,
+		})
 		return
 	}
 
@@ -308,7 +340,7 @@ func (s *Socket) OnceDisconnect(cb func(s *Socket, err error)) {
 	s.disconnectHandles.Once(cb)
 }
 
-func (s *Socket) OnDialError(cb func(s *Socket, err error)) {
+func (s *Socket) OnDialError(cb func(s *Socket, err *DialErrorContext)) {
 	s.dialErrorHandles.On(cb)
 }
 
@@ -486,9 +518,17 @@ func (s *Socket) sendPkt(wsconn *websocket.Conn, pkt *Packet) (err error) {
 }
 
 func (s *Socket) Close() error {
-	s.send(&Packet{
-		typ: CLOSE,
-	})
+	reconnectTimer := s.reconnectTimer.Swap(nil)
+	if reconnectTimer != nil {
+		reconnectTimer.Stop()
+	}
+	if s.Status() != SocketClosed {
+		s.send(&Packet{
+			typ: CLOSE,
+		})
+		return nil
+	}
+	s.status.Store(SocketClosed)
 	return nil
 }
 

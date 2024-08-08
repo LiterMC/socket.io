@@ -21,7 +21,9 @@ package socket
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
+	"reflect"
 	"sync"
 	"sync/atomic"
 
@@ -63,6 +65,7 @@ type Socket struct {
 	namespace     string
 	autoReconnect bool
 	auth          map[string]any
+	lastOffset    string
 
 	packet               Packet
 	reconstructingAttach int
@@ -97,7 +100,7 @@ func WithAuthToken(token string) Option {
 	}
 }
 
-func WithAuthTokenFn(tokenGen func() string) Option {
+func WithAuthTokenFn(tokenGen func() (string, error)) Option {
 	return func(s *Socket) {
 		s.auth = map[string]any{
 			"token": tokenGen,
@@ -152,25 +155,60 @@ func (s *Socket) IO() *engine.Socket {
 	return s.io
 }
 
+var (
+	typSocket = reflect.TypeOf((*Socket)(nil))
+	typError  = reflect.TypeOf((*error)(nil)).Elem()
+)
+
 func (s *Socket) sendConnPkt() error {
 	s.beforeConnectHandles.Call(s, struct{}{})
 	pkt := &Packet{
 		typ:       CONNECT,
 		namespace: s.namespace,
 	}
+	data := make(map[string]any, 4)
 	if s.auth != nil {
-		data := make(map[string]any)
-		for k, v := range s.auth {
-			switch v := v.(type) {
-			// TODO: support any function type use reflect
-			case func() string:
-				data[k] = v()
-			case func() any:
-				data[k] = v()
-			default:
-				data[k] = v
+		for k, v0 := range s.auth {
+			if m, ok := v0.(json.Marshaler); ok {
+				data[k] = m
+				continue
 			}
+			v := reflect.ValueOf(v0)
+			if t := v.Type(); t.Kind() == reflect.Func {
+				var in []reflect.Value
+				if t.NumIn() > 1 {
+					return errors.New("socket.io: \"" + k + "\": The callback function can only have maximum one input argument")
+				}
+				if t.NumIn() == 1 {
+					if t.In(0) != typSocket {
+						return errors.New("socket.io: \"" + k + "\": The first input of the callback function must be *Socket")
+					}
+					in = append(in, reflect.ValueOf(s))
+				}
+				if t.NumOut() == 2 {
+					if t.Out(1) != typError {
+						return errors.New("socket.io: \"" + k + "\": The second output of the callback function must be error interface")
+					}
+				} else if t.NumOut() != 1 {
+					return errors.New("socket.io: \"" + k + "\": The callback function can only have 1 or 2 output values")
+				}
+				out := v.Call(in)
+				if len(out) > 1 && !out[1].IsNil() {
+					if err := out[1].Interface().(error); err != nil {
+						return err
+					}
+				}
+				data[k] = out[0].Interface()
+				continue
+			}
+			data[k] = v
 		}
+	}
+	if s.pid != "" {
+		data["pid"] = s.pid
+		data["offset"] = s.lastOffset
+	}
+	if len(data) > 0 {
 		if err := pkt.SetData(data); err != nil {
 			return err
 		}
