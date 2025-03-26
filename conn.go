@@ -201,7 +201,7 @@ func (s *Socket) sendConnPkt() error {
 				data[k] = out[0].Interface()
 				continue
 			}
-			data[k] = v
+			data[k] = v.Interface()
 		}
 	}
 	if s.pid != "" {
