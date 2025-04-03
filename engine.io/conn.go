@@ -533,9 +533,9 @@ func (s *Socket) Close() error {
 }
 
 func (s *Socket) send(pkt *Packet) {
-	s.mux.Lock()
-	defer s.mux.Unlock()
 	if s.Status() != SocketConnected {
+		s.mux.Lock()
+		defer s.mux.Unlock()
 		s.msgbuf = append(s.msgbuf, pkt)
 		return
 	}
