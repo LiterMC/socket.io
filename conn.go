@@ -409,7 +409,8 @@ func (s *Socket) onMessage(_ *engine.Socket, data []byte) {
 		}
 		s.sid = obj.Sid
 		s.pid = obj.Pid
-		for _, bts := range s.msgbuf {
+		for i, bts := range s.msgbuf {
+			s.msgbuf[i] = nil
 			s.io.Emit(bts)
 		}
 		s.msgbuf = s.msgbuf[:0]
@@ -451,8 +452,13 @@ func (s *Socket) send(pkt *Packet) (err error) {
 		switch pkt.typ {
 		case EVENT, BINARY_EVENT, ACK, BINARY_ACK:
 			s.mux.Lock()
-			s.msgbuf = append(s.msgbuf, bts)
-			s.mux.Unlock()
+			if s.Status() == SocketConnected {
+				s.mux.Unlock()
+				s.io.Emit(bts)
+			} else {
+				s.msgbuf = append(s.msgbuf, bts)
+				s.mux.Unlock()
+			}
 		default:
 			if s.io.Connected() {
 				s.io.Emit(bts)
