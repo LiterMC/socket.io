@@ -316,20 +316,12 @@ func (s *Socket) OnConnect(cb func(s *Socket)) {
 	s.connectHandles.On(func(s *Socket, _ struct{}) {
 		cb(s)
 	})
-	// TODO: Or maybe?
-	// ptr := new(func(s *Socket))
-	// *ptr = cb
-	// s.connectHandles.On(*(func(*Socket, struct{}))((unsafe.Pointer)(ptr)))
 }
 
 func (s *Socket) OnceConnect(cb func(s *Socket)) {
-	if s.Connected() {
+	s.connectHandles.Once(func(s *Socket, _ struct{}) {
 		cb(s)
-	} else {
-		s.connectHandles.Once(func(s *Socket, _ struct{}) {
-			cb(s)
-		})
-	}
+	})
 }
 
 func (s *Socket) OnDisconnect(cb func(s *Socket, err error)) {
